@@ -1,17 +1,18 @@
+# vim: sw=4 ts=4 sts=4 expandtab
 #
-# Copyright (c) 2013, Intel Corporation.
+# Copyright (C) 2013 Intel Corporation.
+# Copyright (C) 2025 Advanced Micro Devices, Inc.
 #
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # DESCRIPTION
 
-# This module implements the image creation engine used by 'wic' to
-# create images.  The engine parses through the OpenEmbedded kickstart
-# (wks) file specified and generates images that can then be directly
-# written onto media.
+# This module implements the image manipulation engine used by 'wim' to
+# modify images.
 #
 # AUTHORS
 # Tom Zanussi <tom.zanussi (at] linux.intel.com>
+# Trevor Woerner <trevor.woerner (at] amd.com>
 #
 
 import logging
@@ -24,202 +25,11 @@ import re
 
 from collections import namedtuple, OrderedDict
 
-from wic import WicError
-from wic.filemap import sparse_copy
-from wic.pluginbase import PluginMgr
-from wic.misc import get_bitbake_var, exec_cmd
+from wim import WimError
+from wim.filemap import sparse_copy
+from wim.misc import exec_cmd
 
-logger = logging.getLogger('wic')
-
-def verify_build_env():
-    """
-    Verify that the build environment is sane.
-
-    Returns True if it is, false otherwise
-    """
-    if not os.environ.get("BUILDDIR"):
-        raise WicError("BUILDDIR not found, exiting. (Did you forget to source oe-init-build-env?)")
-
-    return True
-
-
-CANNED_IMAGE_DIR = "lib/wic/canned-wks" # relative to scripts
-SCRIPTS_CANNED_IMAGE_DIR = "scripts/" + CANNED_IMAGE_DIR
-WIC_DIR = "wic"
-
-def build_canned_image_list(path):
-    layers_path = get_bitbake_var("BBLAYERS")
-    canned_wks_layer_dirs = []
-
-    if layers_path is not None:
-        for layer_path in layers_path.split():
-            for wks_path in (WIC_DIR, SCRIPTS_CANNED_IMAGE_DIR):
-                cpath = os.path.join(layer_path, wks_path)
-                if os.path.isdir(cpath):
-                    canned_wks_layer_dirs.append(cpath)
-
-    cpath = os.path.join(path, CANNED_IMAGE_DIR)
-    canned_wks_layer_dirs.append(cpath)
-
-    return canned_wks_layer_dirs
-
-def find_canned_image(scripts_path, wks_file):
-    """
-    Find a .wks file with the given name in the canned files dir.
-
-    Return False if not found
-    """
-    layers_canned_wks_dir = build_canned_image_list(scripts_path)
-
-    for canned_wks_dir in layers_canned_wks_dir:
-        for root, dirs, files in os.walk(canned_wks_dir):
-            for fname in files:
-                if fname.endswith("~") or fname.endswith("#"):
-                    continue
-                if ((fname.endswith(".wks") and wks_file + ".wks" == fname) or \
-                   (fname.endswith(".wks.in") and wks_file + ".wks.in" == fname)):
-                    fullpath = os.path.join(canned_wks_dir, fname)
-                    return fullpath
-    return None
-
-
-def list_canned_images(scripts_path):
-    """
-    List the .wks files in the canned image dir, minus the extension.
-    """
-    layers_canned_wks_dir = build_canned_image_list(scripts_path)
-
-    for canned_wks_dir in layers_canned_wks_dir:
-        for root, dirs, files in os.walk(canned_wks_dir):
-            for fname in files:
-                if fname.endswith("~") or fname.endswith("#"):
-                    continue
-                if fname.endswith(".wks") or fname.endswith(".wks.in"):
-                    fullpath = os.path.join(canned_wks_dir, fname)
-                    with open(fullpath) as wks:
-                        for line in wks:
-                            desc = ""
-                            idx = line.find("short-description:")
-                            if idx != -1:
-                                desc = line[idx + len("short-description:"):].strip()
-                                break
-                    basename = fname.split('.')[0]
-                    print("  %s\t\t%s" % (basename.ljust(30), desc))
-
-
-def list_canned_image_help(scripts_path, fullpath):
-    """
-    List the help and params in the specified canned image.
-    """
-    found = False
-    with open(fullpath) as wks:
-        for line in wks:
-            if not found:
-                idx = line.find("long-description:")
-                if idx != -1:
-                    print()
-                    print(line[idx + len("long-description:"):].strip())
-                    found = True
-                continue
-            if not line.strip():
-                break
-            idx = line.find("#")
-            if idx != -1:
-                print(line[idx + len("#:"):].rstrip())
-            else:
-                break
-
-
-def list_source_plugins():
-    """
-    List the available source plugins i.e. plugins available for --source.
-    """
-    plugins = PluginMgr.get_plugins('source')
-
-    for plugin in plugins:
-        print("  %s" % plugin)
-
-
-def wic_create(wks_file, rootfs_dir, bootimg_dir, kernel_dir,
-               native_sysroot, options):
-    """
-    Create image
-
-    wks_file - user-defined OE kickstart file
-    rootfs_dir - absolute path to the build's /rootfs dir
-    bootimg_dir - absolute path to the build's boot artifacts directory
-    kernel_dir - absolute path to the build's kernel directory
-    native_sysroot - absolute path to the build's native sysroots dir
-    image_output_dir - dirname to create for image
-    options - wic command line options (debug, bmap, etc)
-
-    Normally, the values for the build artifacts values are determined
-    by 'wic -e' from the output of the 'bitbake -e' command given an
-    image name e.g. 'core-image-minimal' and a given machine set in
-    local.conf.  If that's the case, the variables get the following
-    values from the output of 'bitbake -e':
-
-    rootfs_dir:        IMAGE_ROOTFS
-    kernel_dir:        DEPLOY_DIR_IMAGE
-    native_sysroot:    STAGING_DIR_NATIVE
-
-    In the above case, bootimg_dir remains unset and the
-    plugin-specific image creation code is responsible for finding the
-    bootimg artifacts.
-
-    In the case where the values are passed in explicitly i.e 'wic -e'
-    is not used but rather the individual 'wic' options are used to
-    explicitly specify these values.
-    """
-    try:
-        oe_builddir = os.environ["BUILDDIR"]
-    except KeyError:
-        raise WicError("BUILDDIR not found, exiting. (Did you forget to source oe-init-build-env?)")
-
-    if not os.path.exists(options.outdir):
-        os.makedirs(options.outdir)
-
-    pname = options.imager
-    plugin_class = PluginMgr.get_plugins('imager').get(pname)
-    if not plugin_class:
-        raise WicError('Unknown plugin: %s' % pname)
-
-    plugin = plugin_class(wks_file, rootfs_dir, bootimg_dir, kernel_dir,
-                          native_sysroot, oe_builddir, options)
-
-    plugin.do_create()
-
-    logger.info("The image(s) were created using OE kickstart file:\n  %s", wks_file)
-
-
-def wic_list(args, scripts_path):
-    """
-    Print the list of images or source plugins.
-    """
-    if args.list_type is None:
-        return False
-
-    if args.list_type == "images":
-
-        list_canned_images(scripts_path)
-        return True
-    elif args.list_type == "source-plugins":
-        list_source_plugins()
-        return True
-    elif len(args.help_for) == 1 and args.help_for[0] == 'help':
-        wks_file = args.list_type
-        fullpath = find_canned_image(scripts_path, wks_file)
-        if not fullpath:
-            raise WicError("No image named %s found, exiting. "
-                           "(Use 'wic list images' to list available images, "
-                           "or specify a fully-qualified OE kickstart (.wks) "
-                           "filename)" % wks_file)
-
-        list_canned_image_help(scripts_path, fullpath)
-        return True
-
-    return False
-
+logger = logging.getLogger('wim')
 
 class Disk:
     def __init__(self, imagepath, native_sysroot, fstypes=('fat', 'ext')):
@@ -233,14 +43,7 @@ class Disk:
         self._ptable_format = None
 
         # define sector size
-        sector_size_str = get_bitbake_var('WIC_SECTOR_SIZE')
-        if sector_size_str is not None:
-            try:
-                self.sector_size = int(sector_size_str)
-            except ValueError:
-                self.sector_size = None
-        else:
-            self.sector_size = None
+        self.sector_size = None
 
         # find parted
         # read paths from $PATH environment variable
@@ -257,7 +60,7 @@ class Disk:
 
         self.parted = shutil.which("parted", path=self.paths)
         if not self.parted:
-            raise WicError("Can't find executable parted")
+            raise WimError("Can't find executable parted")
 
         self.partitions = self.get_partitions()
 
@@ -281,7 +84,7 @@ class Disk:
             try:
                 idx =splitted.index("BYT;")
             except ValueError:
-                raise WicError("Error getting partition information from %s" % (self.parted))
+                raise WimError("Error getting partition information from %s" % (self.parted))
             lsector_size, psector_size, self._ptable_format = splitted[idx + 1].split(":")[3:6]
             self._lsector_size = int(lsector_size)
             self._psector_size = int(psector_size)
@@ -301,22 +104,22 @@ class Disk:
             if aname not in self.__dict__:
                 setattr(self, aname, shutil.which(name, path=self.paths))
                 if aname not in self.__dict__ or self.__dict__[aname] is None:
-                    raise WicError("Can't find executable '{}'".format(name))
+                    raise WimError("Can't find executable '{}'".format(name))
             return self.__dict__[aname]
         return self.__dict__[name]
 
     def _get_part_image(self, pnum):
         if pnum not in self.partitions:
-            raise WicError("Partition %s is not in the image" % pnum)
+            raise WimError("Partition %s is not in the image" % pnum)
         part = self.partitions[pnum]
         # check if fstype is supported
         for fstype in self.fstypes:
             if part.fstype.startswith(fstype):
                 break
         else:
-            raise WicError("Not supported fstype: {}".format(part.fstype))
+            raise WimError("Not supported fstype: {}".format(part.fstype))
         if pnum not in self._partimages:
-            tmpf = tempfile.NamedTemporaryFile(prefix="wic-part")
+            tmpf = tempfile.NamedTemporaryFile(prefix="wim-part")
             dst_fname = tmpf.name
             tmpf.close()
             sparse_copy(self.imagepath, dst_fname, skip=part.start, length=part.size)
@@ -331,7 +134,7 @@ class Disk:
 
     def dir(self, pnum, path):
         if pnum not in self.partitions:
-            raise WicError("Partition %s is not in the image" % pnum)
+            raise WimError("Partition %s is not in the image" % pnum)
 
         if self.partitions[pnum].fstype.startswith('ext'):
             return exec_cmd("{} {} -R 'ls -l {}'".format(self.debugfs,
@@ -343,7 +146,7 @@ class Disk:
                                                    path))
 
     def copy(self, src, dest):
-        """Copy partition image into wic image."""
+        """Copy partition image into wim image."""
         pnum =  dest.part if isinstance(src, str) else src.part
 
         if self.partitions[pnum].fstype.startswith('ext'):
@@ -351,7 +154,7 @@ class Disk:
                 cmd = "printf 'cd {}\nwrite {} {}\n' | {} -w {}".\
                       format(os.path.dirname(dest.path), src, os.path.basename(src),
                              self.debugfs, self._get_part_image(pnum))
-            else: # copy from wic
+            else: # copy from wim
                 # run both dump and rdump to support both files and directory
                 cmd = "printf 'cd {}\ndump /{} {}\nrdump /{} {}\n' | {} {}".\
                       format(os.path.dirname(src.path), src.path,
@@ -400,14 +203,14 @@ class Disk:
 
                     for rmdir_line in rmdir_out.splitlines():
                         if "directory not empty" in rmdir_line:
-                            raise WicError("Could not complete operation: \n%s \n"
+                            raise WimError("Could not complete operation: \n%s \n"
                                             "use -r to remove non-empty directory" % rmdir_line)
                         if rmdir_line.startswith("rmdir:"):
-                            raise WicError("Could not complete operation: \n%s "
+                            raise WimError("Could not complete operation: \n%s "
                                             "\n%s" % (str(line), rmdir_line))
 
                 else:
-                    raise WicError("Could not complete operation: \n%s "
+                    raise WimError("Could not complete operation: \n%s "
                                     "\nUnable to remove %s" % (str(line), abs_path))
 
     def remove(self, pnum, path, recursive):
@@ -420,7 +223,7 @@ class Disk:
             cmd = "{} -i {} ::{}".format(self.mdel, partimg, path)
             try:
                 exec_cmd(cmd)
-            except WicError as err:
+            except WimError as err:
                 if "not found" in str(err) or "non empty" in str(err):
                     # mdel outputs 'File ... not found' or 'directory .. non empty"
                     # try to use mdeltree as path could be a directory
@@ -462,7 +265,7 @@ class Disk:
             return json.loads(out)
 
         def write_ptable(parts, target):
-            with tempfile.NamedTemporaryFile(prefix="wic-sfdisk-", mode='w') as outf:
+            with tempfile.NamedTemporaryFile(prefix="wim-sfdisk-", mode='w') as outf:
                 write_sfdisk_script(outf, parts)
                 cmd = "{} --no-reread {} < {} ".format(self.sfdisk, target, outf.name)
                 exec_cmd(cmd, as_shell=True)
@@ -485,7 +288,7 @@ class Disk:
                     # Align free space to a 2048 sector boundary. YOCTO #12840.
                     free = free - (free % 2048)
             if free is None:
-                raise WicError("Can't get size of unpartitioned space")
+                raise WimError("Can't get size of unpartitioned space")
 
             # calculate expanded partitions sizes
             sizes = {}
@@ -527,7 +330,7 @@ class Disk:
                    fstype.startswith('linux-swap'):
 
                     partfname = None
-                    with tempfile.NamedTemporaryFile(prefix="wic-part{}-".format(pnum)) as partf:
+                    with tempfile.NamedTemporaryFile(prefix="wim-part{}-".format(pnum)) as partf:
                         partfname = partf.name
 
                     if fstype.startswith('ext'):
@@ -539,7 +342,7 @@ class Disk:
                                  self.resize2fs, partfname, part['size']))
                     elif fstype.startswith('fat'):
                         logger.info("copying content of the fat partition {}".format(pnum))
-                        with tempfile.TemporaryDirectory(prefix='wic-fatdir-') as tmpdir:
+                        with tempfile.TemporaryDirectory(prefix='wim-fatdir-') as tmpdir:
                             # copy content to the temporary directory
                             cmd = "{} -snompi {} :: {}".format(self.mcopy,
                                                                self._get_part_image(pnum),
@@ -570,7 +373,7 @@ class Disk:
                 elif part['type'] != 'f':
                     logger.warning("skipping partition {}: unsupported fstype {}".format(pnum, fstype))
 
-def wic_ls(args, native_sysroot):
+def wim_ls(args, native_sysroot):
     """List contents of partitioned image or vfat partition."""
     disk = Disk(args.path.image, native_sysroot)
     if not args.path.part:
@@ -584,7 +387,7 @@ def wic_ls(args, native_sysroot):
         path = args.path.path or '/'
         print(disk.dir(args.path.part, path))
 
-def wic_cp(args, native_sysroot):
+def wim_cp(args, native_sysroot):
     """
     Copy file or directory to/from the vfat/ext partition of
     partitioned image.
@@ -596,7 +399,7 @@ def wic_cp(args, native_sysroot):
     disk.copy(args.src, args.dest)
 
 
-def wic_rm(args, native_sysroot):
+def wim_rm(args, native_sysroot):
     """
     Remove files or directories from the vfat partition of
     partitioned image.
@@ -604,41 +407,9 @@ def wic_rm(args, native_sysroot):
     disk = Disk(args.path.image, native_sysroot)
     disk.remove(args.path.part, args.path.path, args.recursive_delete)
 
-def wic_write(args, native_sysroot):
+def wim_write(args, native_sysroot):
     """
     Write image to a target device.
     """
     disk = Disk(args.image, native_sysroot, ('fat', 'ext', 'linux-swap'))
     disk.write(args.target, args.expand)
-
-def find_canned(scripts_path, file_name):
-    """
-    Find a file either by its path or by name in the canned files dir.
-
-    Return None if not found
-    """
-    if os.path.exists(file_name):
-        return file_name
-
-    layers_canned_wks_dir = build_canned_image_list(scripts_path)
-    for canned_wks_dir in layers_canned_wks_dir:
-        for root, dirs, files in os.walk(canned_wks_dir):
-            for fname in files:
-                if fname == file_name:
-                    fullpath = os.path.join(canned_wks_dir, fname)
-                    return fullpath
-
-def get_custom_config(boot_file):
-    """
-    Get the custom configuration to be used for the bootloader.
-
-    Return None if the file can't be found.
-    """
-    # Get the scripts path of poky
-    scripts_path = os.path.abspath("%s/../.." % os.path.dirname(__file__))
-
-    cfg_file = find_canned(scripts_path, boot_file)
-    if cfg_file:
-        with open(cfg_file, "r") as f:
-            config = f.read()
-        return config

@@ -1,14 +1,17 @@
+# vim: sw=4 ts=4 sts=4 expandtab
 #
-# Copyright (c) 2013, Intel Corporation.
+# Copyright (C) 2013 Intel Corporation.
+# Copyright (C) 2025 Advanced Micro Devices, Inc.
 #
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # DESCRIPTION
-# This module provides a place to collect various wic-related utils
+# This module provides a place to collect various wim-related utils
 # for the OpenEmbedded Image Tools.
 #
 # AUTHORS
 # Tom Zanussi <tom.zanussi (at] linux.intel.com>
+# Trevor Woerner <trevor.woerner (at] amd.com>
 #
 """Miscellaneous functions."""
 
@@ -20,9 +23,9 @@ import shutil
 
 from collections import defaultdict
 
-from wic import WicError
+from wim import WimError
 
-logger = logging.getLogger('wic')
+logger = logging.getLogger('wim')
 
 # executable -> recipe pairs for exec_native_cmd
 NATIVE_RECIPES = {"bmaptool": "bmaptool",
@@ -78,7 +81,7 @@ def runtool(cmdln_or_args):
     except OSError as err:
         if err.errno == 2:
             # [Errno 2] No such file or directory
-            raise WicError('Cannot run command: %s, lost dependency?' % cmd)
+            raise WimError('Cannot run command: %s, lost dependency?' % cmd)
         else:
             raise # relay
 
@@ -100,7 +103,7 @@ def _exec_cmd(cmd_and_args, as_shell=False):
         ret, out = runtool(args)
     out = out.strip()
     if ret != 0:
-        raise WicError("_exec_cmd: %s returned '%s' instead of 0\noutput: %s" % \
+        raise WimError("_exec_cmd: %s returned '%s' instead of 0\noutput: %s" % \
                        (cmd_and_args, ret, out))
 
     logger.debug("_exec_cmd: output for %s (rc = %d): %s",
@@ -167,100 +170,10 @@ def exec_native_cmd(cmd_and_args, native_sysroot, pseudo=""):
               "was not found (see details above).\n\n" % prog
         recipe = NATIVE_RECIPES.get(prog)
         if recipe:
-            msg += "Please make sure wic-tools have %s-native in its DEPENDS, "\
-                   "build it with 'bitbake wic-tools' and try again.\n" % recipe
+            msg += "Please make sure the SDK has %s-native in its nativesdk.\n" % recipe
         else:
-            msg += "Wic failed to find a recipe to build native %s. Please "\
-                   "file a bug against wic.\n" % prog
-        raise WicError(msg)
+            msg += "Wim failed to find a recipe to build native %s. Please "\
+                   "file a bug against wim.\n" % prog
+        raise WimError(msg)
 
     return ret, out
-
-BOOTDD_EXTRA_SPACE = 16384
-
-class BitbakeVars(defaultdict):
-    """
-    Container for Bitbake variables.
-    """
-    def __init__(self):
-        defaultdict.__init__(self, dict)
-
-        # default_image and vars_dir attributes should be set from outside
-        self.default_image = None
-        self.vars_dir = None
-
-    def _parse_line(self, line, image, matcher=re.compile(r"^([a-zA-Z0-9\-_+./~]+)=(.*)")):
-        """
-        Parse one line from bitbake -e output or from .env file.
-        Put result key-value pair into the storage.
-        """
-        if "=" not in line:
-            return
-        match = matcher.match(line)
-        if not match:
-            return
-        key, val = match.groups()
-        self[image][key] = val.strip('"')
-
-    def get_var(self, var, image=None, cache=True):
-        """
-        Get bitbake variable from 'bitbake -e' output or from .env file.
-        This is a lazy method, i.e. it runs bitbake or parses file only when
-        only when variable is requested. It also caches results.
-        """
-        if not image:
-            image = self.default_image
-
-        if image not in self:
-            if image and self.vars_dir:
-                fname = os.path.join(self.vars_dir, image + '.env')
-                if os.path.isfile(fname):
-                    # parse .env file
-                    with open(fname) as varsfile:
-                        for line in varsfile:
-                            self._parse_line(line, image)
-                else:
-                    print("Couldn't get bitbake variable from %s." % fname)
-                    print("File %s doesn't exist." % fname)
-                    return
-            else:
-                # Get bitbake -e output
-                cmd = "bitbake -e"
-                if image:
-                    cmd += " %s" % image
-
-                log_level = logger.getEffectiveLevel()
-                logger.setLevel(logging.INFO)
-                ret, lines = _exec_cmd(cmd)
-                logger.setLevel(log_level)
-
-                if ret:
-                    logger.error("Couldn't get '%s' output.", cmd)
-                    logger.error("Bitbake failed with error:\n%s\n", lines)
-                    return
-
-                # Parse bitbake -e output
-                for line in lines.split('\n'):
-                    self._parse_line(line, image)
-
-            # Make first image a default set of variables
-            if cache:
-                images = [key for key in self if key]
-                if len(images) == 1:
-                    self[None] = self[image]
-
-        result = self[image].get(var)
-        if not cache:
-            self.pop(image, None)
-
-        return result
-
-# Create BB_VARS singleton
-BB_VARS = BitbakeVars()
-
-def get_bitbake_var(var, image=None, cache=True):
-    """
-    Provide old get_bitbake_var API by wrapping
-    get_var method of BB_VARS singleton.
-    """
-    return BB_VARS.get_var(var, image, cache)

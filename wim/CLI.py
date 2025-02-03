@@ -29,14 +29,9 @@ import shutil
 
 from collections import namedtuple
 
-# External modules
-scripts_path = os.path.dirname(os.path.realpath(__file__))
-lib_path = scripts_path + '/lib'
-sys.path.insert(0, lib_path)
-
-from wim import WimError
-from wim import engine
-from wim import help as hlp
+from . import WimError
+from . import engine
+from . import help as hlp
 
 
 def wim_logger():
@@ -265,13 +260,13 @@ class WimArgumentParser(argparse.ArgumentParser):
      def format_help(self):
          return hlp.wim_help
 
-def main(argv):
+def main():
     parser = WimArgumentParser(
         description="wim version %s" % __version__)
 
     init_parser(parser)
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(sys.argv[1:])
 
     if args.debug:
         logger.setLevel(logging.DEBUG)
@@ -300,7 +295,7 @@ def main(argv):
 
 if __name__ == "__main__":
     try:
-        sys.exit(main(sys.argv[1:]))
+        sys.exit(main())
     except WimError as err:
         print()
         logger.error(err)
